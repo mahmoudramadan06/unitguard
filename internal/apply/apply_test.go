@@ -253,3 +253,99 @@ func TestFSStoreRoundTrip(t *testing.T) {
 		t.Fatal("expected drop-in removed")
 	}
 }
+
+type memBackup struct{ files map[string][]byte }
+
+func newMemBackup() memBackup { return memBackup{files: map[string][]byte{}} }
+func (m memBackup) Save(u string, d []byte) error {
+	m.files[u] = d
+	return nil
+}
+func (m memBackup) Load(u string) ([]byte, error) {
+	b, ok := m.files[u]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return b, nil
+}
+func (m memBackup) Clear(u string) error {
+	delete(m.files, u)
+	return nil
+}
+
+func TestRollbackRestoresBackupAcrossProcesses(t *testing.T) {
+	// Simulate a crash: the applying Applier disappears; a fresh Applier
+	// with the same stores must restore the pre-apply drop-in bytes.
+	sys := loadedActive()
+	store := memStore{files: map[string][]byte{"demo.service": []byte("old")}}
+	backup := newMemBackup()
+	first := &Applier{Systemd: sys, Store: store, Health: &fakeHealth{}, Backup: backup}
+	if _, err := first.Apply(context.Background(), "demo.service", []byte("new"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(store.files["demo.service"]); got != "new" {
+		t.Fatalf("precondition: drop-in = %q", got)
+	}
+
+	second := &Applier{Systemd: sys, Store: store, Backup: backup}
+	if err := second.Rollback(context.Background(), "demo.service"); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(store.files["demo.service"]); got != "old" {
+		t.Errorf("rollback after crash restored %q, want %q", got, "old")
+	}
+}
+
+func TestRollbackWithoutBackupRemovesDropin(t *testing.T) {
+	sys := loadedActive()
+	store := memStore{files: map[string][]byte{"demo.service": []byte("x")}}
+	a := &Applier{Systemd: sys, Store: store, Backup: newMemBackup()}
+	if err := a.Rollback(context.Background(), "demo.service"); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := store.files["demo.service"]; exists {
+		t.Error("drop-in should be removed when no backup exists")
+	}
+}
+
+func TestCanceledContextStillRollsBack(t *testing.T) {
+	sys := loadedActive()
+	store := memStore{files: map[string][]byte{}}
+	a := &Applier{Systemd: sys, Store: store, Settle: time.Hour} // settle blocks
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel() // SIGINT mid-apply
+	}()
+	res, err := a.Apply(ctx, "demo.service", []byte("new"), nil)
+	if err == nil || !res.RolledBack {
+		t.Fatalf("canceled apply must roll back: res=%+v err=%v", res, err)
+	}
+	if !sys.active {
+		t.Error("rollback should have run despite the canceled context")
+	}
+	if len(sys.restarts) != 2 {
+		t.Errorf("expected apply + rollback restarts, got %v", sys.restarts)
+	}
+}
+
+func TestFSBackupStoreRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	s := FSBackupStore{Dir: dir}
+	if _, err := s.Load("a.service"); !os.IsNotExist(err) {
+		t.Fatalf("want IsNotExist, got %v", err)
+	}
+	if err := s.Save("a.service", []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.Load("a.service")
+	if err != nil || string(b) != "data" {
+		t.Fatalf("got %q, %v", b, err)
+	}
+	if err := s.Clear("a.service"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Load("a.service"); !os.IsNotExist(err) {
+		t.Fatal("expected cleared")
+	}
+}
