@@ -199,3 +199,32 @@ func (g SystemdRunGuard) Arm(ctx context.Context, unit string, within time.Durat
 		return nil
 	}, nil
 }
+
+// FSBackupStore persists pre-apply drop-in bytes under Dir (normally
+// /var/lib/unitguard) so rollback survives process crashes and reboots.
+type FSBackupStore struct {
+	Dir string
+}
+
+func (s FSBackupStore) path(unit string) string {
+	return filepath.Join(s.Dir, unit+".bak")
+}
+
+func (s FSBackupStore) Save(unit string, data []byte) error {
+	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(s.path(unit), data, 0o600)
+}
+
+func (s FSBackupStore) Load(unit string) ([]byte, error) {
+	return os.ReadFile(s.path(unit)) // os.IsNotExist propagates
+}
+
+func (s FSBackupStore) Clear(unit string) error {
+	err := os.Remove(s.path(unit))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
