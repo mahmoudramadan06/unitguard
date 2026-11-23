@@ -3,12 +3,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mahmoudramadan06/unitguard/internal/apply"
@@ -21,19 +24,25 @@ import (
 const usage = `unitguard - generate and safely apply least-privilege systemd sandboxing
 
 Usage:
-  unitguard observe  --unit NAME [--duration 30s] [--cmd "command args"] [--out obs.json]
-  unitguard generate [--unit NAME] [--observation obs.json] [--out override.conf]
-  unitguard apply    --unit NAME [--observation obs.json] [--health-check "cmd"] [--yes]
+  unitguard observe  (--unit NAME | --cmd "command args") [--duration 30s] [--out obs.json]
+  unitguard generate --observation obs.json [--unit NAME] [--out override.conf]
+  unitguard apply    --unit NAME (--observation obs.json | --dropin file) [--health-check "cmd"] [--yes]
   unitguard rollback --unit NAME
-  unitguard verify   --unit NAME [--dropin path]
+  unitguard verify   (--unit NAME [--security] | --dropin file)
 
-observe traces the service's ExecStart (or --cmd) with strace and records
-what it actually does. generate turns that observation into a drop-in.
-apply writes the drop-in, restarts the service, health-checks it and rolls
-back automatically on failure. rollback removes the drop-in. verify runs
-systemd-analyze on the result.
+observe traces a command (--cmd, or a unit's single ExecStart) with strace
+and records what it actually does. generate turns that observation into a
+drop-in. apply writes the drop-in, restarts the service, health-checks it
+and rolls back automatically on failure. rollback restores the pre-apply
+drop-in state (persisted under /var/lib/unitguard). verify lints a unit
+file or a live unit's merged definition with systemd-analyze verify.
 
-apply and rollback need root and a live systemd. observe needs strace.
+apply and rollback need root and a live systemd. observe needs strace (and
+root or ptrace permission when the traced process is not yours).
+
+generate/apply hardening flags (opt-in): --drop-caps, --remove-ipc,
+--private-devices; --allow-late-network relaxes the family restriction.
+apply also takes --dropin, --health-check, --settle, --yes.
 `
 
 func main() {
@@ -96,7 +105,11 @@ func cmdObserve(args []string) error {
 	var argv []string
 	switch {
 	case *cmdStr != "":
-		argv = strings.Fields(*cmdStr)
+		w, err := splitWords(*cmdStr)
+		if err != nil {
+			return fmt.Errorf("--cmd: %w", err)
+		}
+		argv = w
 	case *unitName != "":
 		text, err := (apply.RealSystemd{}).Cat(ctx, *unitName)
 		if err != nil {
@@ -108,6 +121,9 @@ func cmdObserve(args []string) error {
 		}
 		if len(cmds) == 0 {
 			return fmt.Errorf("unit %s has no ExecStart", *unitName)
+		}
+		if len(cmds) > 1 {
+			return fmt.Errorf("unit %s has %d ExecStart commands (e.g. Type=oneshot); tracing only the first would produce a wrong profile, refusing. Trace the real workload with --cmd instead", *unitName, len(cmds))
 		}
 		if specs := cmds[0].UnexpandedSpecifiers; len(specs) > 0 {
 			return fmt.Errorf("ExecStart contains unexpanded specifiers %v; use --cmd with the real command line", specs)
@@ -124,7 +140,10 @@ func cmdObserve(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "observed: %s\n", obs)
 	if *out == "" {
-		b, _ := json.MarshalIndent(obs, "", "  ")
+		b, err := json.MarshalIndent(obs, "", "  ")
+		if err != nil {
+			return err
+		}
 		fmt.Println(string(b))
 		return nil
 	}
@@ -182,6 +201,10 @@ func cmdApply(args []string) error {
 	health := fs.String("health-check", "", "command that must exit 0 after restart")
 	settle := fs.Duration("settle", 2*time.Second, "wait after restart before checking state")
 	yes := fs.Bool("yes", false, "do not ask for confirmation")
+	lateNet := fs.Bool("allow-late-network", false, "allow IPv4/IPv6 even if no socket was observed")
+	privDev := fs.Bool("private-devices", false, "also hide physical /dev devices")
+	dropCaps := fs.Bool("drop-caps", false, "empty CapabilityBoundingSet (strong; load-test first)")
+	removeIPC := fs.Bool("remove-ipc", false, "remove SysV/POSIX IPC objects on stop")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -205,11 +228,16 @@ func cmdApply(args []string) error {
 		if err != nil {
 			return err
 		}
-		dec := policy.Synthesize(obs, policy.Options{})
+		opts := policy.Options{AllowLateNetwork: *lateNet, PrivateDevices: *privDev, DropCaps: *dropCaps, RemoveIPC: *removeIPC}
+		dec := policy.Synthesize(obs, opts)
 		if err := soundnessGate(obs, dec); err != nil {
 			return err
 		}
-		dropin = []byte(policy.Render(dec))
+		text := "# unitguard drop-in for " + *unitName + "\n" + policy.Render(dec)
+		dropin = []byte(text)
+		for _, n := range dec.Notes {
+			fmt.Fprintln(os.Stderr, "note:", n)
+		}
 		for _, w := range dec.Warnings {
 			fmt.Fprintln(os.Stderr, "WARNING:", w)
 		}
@@ -219,9 +247,11 @@ func cmdApply(args []string) error {
 
 	if !*yes {
 		fmt.Printf("About to sandbox %s and restart it. Drop-in:\n%s\nContinue? [y/N] ", *unitName, dropin)
-		var answer string
-		fmt.Scanln(&answer)
-		if !strings.EqualFold(strings.TrimSpace(answer), "y") {
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && len(line) == 0 {
+			return fmt.Errorf("aborted: no confirmation read: %v", err)
+		}
+		if !strings.EqualFold(strings.TrimSpace(line), "y") {
 			return fmt.Errorf("aborted")
 		}
 	}
@@ -231,13 +261,22 @@ func cmdApply(args []string) error {
 		Store:   apply.FSStore{Root: "/etc/systemd/system"},
 		Health:  apply.ExecRunner{Timeout: 30 * time.Second},
 		Guard:   apply.SystemdRunGuard{},
+		Backup:  apply.FSBackupStore{Dir: "/var/lib/unitguard"},
 		Settle:  *settle,
 	}
 	var healthArgv []string
 	if *health != "" {
-		healthArgv = strings.Fields(*health)
+		w, err := splitWords(*health)
+		if err != nil {
+			return fmt.Errorf("--health-check: %w", err)
+		}
+		healthArgv = w
 	}
-	res, err := a.Apply(context.Background(), *unitName, dropin, healthArgv)
+	// SIGINT/SIGTERM mid-apply must trigger the immediate rollback path,
+	// not kill unitguard; the dead-man timer is only the crash fallback.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	res, err := a.Apply(ctx, *unitName, dropin, healthArgv)
 	switch {
 	case err != nil && res.RollbackFailed:
 		return fmt.Errorf("CRITICAL: %w", err)
@@ -260,24 +299,32 @@ func cmdRollback(args []string) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("rollback needs root")
 	}
-	a := &apply.Applier{Systemd: apply.RealSystemd{}, Store: apply.FSStore{Root: "/etc/systemd/system"}}
+	a := &apply.Applier{
+		Systemd: apply.RealSystemd{},
+		Store:   apply.FSStore{Root: "/etc/systemd/system"},
+		Backup:  apply.FSBackupStore{Dir: "/var/lib/unitguard"},
+	}
 	if err := a.Rollback(context.Background(), *unitName); err != nil {
 		return err
 	}
-	fmt.Println("rolled back: drop-in removed, service restarted")
+	fmt.Println("rolled back: pre-apply drop-in state restored, service restarted")
 	return nil
 }
 
 func cmdVerify(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
-	unitName := fs.String("unit", "", "unit name on a live systemd")
-	dropin := fs.String("dropin", "", "drop-in file to lint with systemd-analyze verify")
+	unitName := fs.String("unit", "", "unit on a live systemd: lint its merged definition")
+	dropin := fs.String("dropin", "", "unit/drop-in file to lint offline with systemd-analyze verify")
+	security := fs.Bool("security", false, "with --unit: also print the systemd-analyze security score")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	ctx := context.Background()
 	an := verify.Analyzer{}
-	if *dropin != "" {
+	switch {
+	case *dropin != "":
+		// Lint a standalone unit/drop-in file. This validates syntax and
+		// directive names only; it cannot prove the service tolerates them.
 		report, err := an.Lint(ctx, *dropin)
 		if report != "" {
 			fmt.Println(report)
@@ -285,17 +332,47 @@ func cmdVerify(args []string) error {
 		if err != nil {
 			return fmt.Errorf("systemd-analyze verify: %w", err)
 		}
-		fmt.Println("verify: systemd-analyze accepted the file")
-	}
-	if *unitName != "" {
-		score, raw, err := an.SecurityScore(ctx, *unitName)
+		fmt.Println("verify: systemd-analyze accepted the file (syntax check)")
+	case *unitName != "":
+		// Lint the unit's merged definition (base unit + drop-ins) as
+		// systemd sees it, via systemctl cat on a live manager.
+		text, err := (apply.RealSystemd{}).Cat(ctx, *unitName)
 		if err != nil {
-			return fmt.Errorf("%w\n%s", err, raw)
+			return err
 		}
-		fmt.Printf("current exposure level for %s: %.1f (lower is better)\n", *unitName, score)
-	}
-	if *dropin == "" && *unitName == "" {
-		return fmt.Errorf("give --unit and/or --dropin")
+		// Strip cat's header comment lines (# /path fragments).
+		var b strings.Builder
+		for _, ln := range strings.Split(text, "\n") {
+			if !strings.HasPrefix(ln, "# ") {
+				b.WriteString(ln + "\n")
+			}
+		}
+		tmp, err := os.CreateTemp("", "unitguard-verify-*.service")
+		if err != nil {
+			return err
+		}
+		defer os.Remove(tmp.Name())
+		if _, err := tmp.WriteString(b.String()); err != nil {
+			return err
+		}
+		tmp.Close()
+		report, err := an.Lint(ctx, tmp.Name())
+		if report != "" {
+			fmt.Println(report)
+		}
+		if err != nil {
+			return fmt.Errorf("systemd-analyze verify: %w", err)
+		}
+		fmt.Println("verify: systemd-analyze accepted the merged unit (syntax check)")
+		if *security {
+			score, raw, err := an.SecurityScore(ctx, *unitName)
+			if err != nil {
+				return fmt.Errorf("%w\n%s", err, raw)
+			}
+			fmt.Printf("current exposure level for %s: %.1f (lower is better)\n", *unitName, score)
+		}
+	default:
+		return fmt.Errorf("give --unit or --dropin")
 	}
 	return nil
 }
