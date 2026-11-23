@@ -55,11 +55,22 @@ type Guard interface {
 	Arm(ctx context.Context, unit string, within time.Duration) (disarm func(context.Context) error, err error)
 }
 
+// BackupStore persists the pre-apply drop-in bytes so rollback still
+// restores them after unitguard crashes or the host reboots (the dead-man
+// timer and manual rollback run in a new process with no in-memory
+// snapshot). os.IsNotExist from Load means no previous drop-in existed.
+type BackupStore interface {
+	Save(unit string, data []byte) error
+	Load(unit string) ([]byte, error)
+	Clear(unit string) error
+}
+
 type Applier struct {
 	Systemd Systemd
 	Store   DropinStore
-	Health  Runner // optional: nil skips user health checks
-	Guard   Guard  // optional: nil disables the dead-man timer
+	Health  Runner      // optional: nil skips user health checks
+	Guard   Guard       // optional: nil disables the dead-man timer
+	Backup  BackupStore // optional: nil keeps rollback snapshots in memory only
 	Settle  time.Duration
 
 	prev    []byte // snapshot of the previous drop-in, for rollback
@@ -163,8 +174,21 @@ func (a *Applier) Apply(ctx context.Context, unit string, dropin []byte, healthA
 	return res, nil
 }
 
-// Rollback removes the unitguard drop-in and restarts the unit.
+// Rollback restores the pre-apply state and restarts the unit: the
+// persisted backup when one exists, otherwise removal of the drop-in.
 func (a *Applier) Rollback(ctx context.Context, unit string) error {
+	if a.Backup != nil {
+		prev, err := a.Backup.Load(unit)
+		switch {
+		case err == nil:
+			if err := a.Store.Write(unit, prev); err != nil {
+				return fmt.Errorf("restore backed-up drop-in: %w", err)
+			}
+			return a.reloadRestart(ctx, unit)
+		case !os.IsNotExist(err):
+			return fmt.Errorf("read drop-in backup: %w", err)
+		}
+	}
 	if err := a.Store.Remove(unit); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove drop-in: %w", err)
 	}
@@ -180,12 +204,28 @@ func (a *Applier) writeDropin(unit string, dropin []byte) error {
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("snapshot existing drop-in: %w", err)
 	}
-	// Keep the snapshot for rollback inside this process.
+	// Keep the snapshot for rollback inside this process, and persist it so
+	// a later process (dead-man timer, manual rollback, after a crash or
+	// reboot) restores the same bytes.
 	a.prev, a.hadPrev = prev, err == nil
+	if a.Backup != nil {
+		if a.hadPrev {
+			if err := a.Backup.Save(unit, prev); err != nil {
+				return fmt.Errorf("persist drop-in backup: %w", err)
+			}
+		} else if err := a.Backup.Clear(unit); err != nil {
+			return fmt.Errorf("clear stale drop-in backup: %w", err)
+		}
+	}
 	return a.Store.Write(unit, dropin)
 }
 
 func (a *Applier) rollback(ctx context.Context, unit string) error {
+	// Rollback must finish even when the caller's context is canceled
+	// (e.g. SIGINT mid-apply): detach it, with its own deadline.
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
 	if a.hadPrev {
 		if err := a.Store.Write(unit, a.prev); err != nil {
 			return err
